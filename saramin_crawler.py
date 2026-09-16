@@ -3,6 +3,8 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import time
 import os
+import re
+import ssl
 from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
@@ -39,6 +41,10 @@ class SaraminCrawler:
         self.work_days = {
             '주5일': 'wsh010', '주6일': 'wsh030', '주3일/격일': 'wsh040',
             '유연근무제': 'wsh050', '면접후결정': 'wsh090'
+        }
+
+        self.location_codes = {
+            '광주': '103000'
         }
 
     def search_jobs(self, keyword=None, **filters):
@@ -162,6 +168,20 @@ class SaraminCrawler:
             if work_day_list:
                 params['work_day'] = ','.join(work_day_list)
 
+        # 근무 지역
+        if 'locations' in filters:
+            location_list = []
+            for location in filters['locations']:
+                if location in self.location_codes:
+                    location_list.append(self.location_codes[location])
+            if location_list:
+                params['loc_mcd'] = ','.join(location_list)
+
+        # 신입 또는 경력무관
+        if filters.get('entry_level_only', False):
+            params['exp_cd'] = '1'
+            params['exp_none'] = 'y'
+
         # 재택근무 가능 유형
         if filters.get('remote_work', False):
             params['work_type'] = '1'
@@ -270,12 +290,12 @@ class SaraminCrawler:
         return filename
     
     def send_email_notification(self, jobs, email_config):
-        """이메일로 공고 알림"""
+        """네이버 메일로 공고 알림"""
         if not jobs:
             return
         
         # 이메일 내용 생성
-        subject = f"🔔 새 채용공고 {len(jobs)}개 발견! - {datetime.now().strftime('%m/%d')}"
+        subject = f"🔔 광주 콘텐츠 마케팅 채용공고 {len(jobs)}개 - {datetime.now().strftime('%m/%d')}"
         
         # HTML 템플릿
         html_body = f"""
@@ -367,16 +387,49 @@ class SaraminCrawler:
                                 filename=f"채용공고_{datetime.now().strftime('%Y%m%d')}.csv")
                     msg.attach(part)
 
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(email_config['sender_email'], email_config['app_password'])
-            server.send_message(msg)
-            server.quit()
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL('smtp.naver.com', 465, context=context) as server:
+                server.login(email_config['sender_email'], email_config['app_password'])
+                server.send_message(msg)
 
             print("📧 이메일 알림을 성공적으로 보냈습니다!")
             
         except Exception as e:
             print(f"❌ 이메일 전송 실패: {e}")
+            raise
+
+    def filter_target_jobs(self, jobs):
+        """광주 지역의 신입 지원 가능 정규직 공고만 남긴다."""
+        excluded_keywords = [
+            '영업', '보험', '텔레마케팅', '방문판매',
+            '부동산', '고객상담', '아웃바운드'
+        ]
+
+        filtered_jobs = []
+        for job in jobs:
+            title = str(job.get('title') or '')
+            location = str(job.get('location') or '')
+            career = str(job.get('career') or '')
+            work_type = str(job.get('work_type') or '')
+
+            is_gwangju = '광주' in location
+            is_entry_level = '신입' in career or '경력무관' in career
+            is_full_time = '정규직' in work_type
+            has_excluded_keyword = any(
+                keyword.lower() in title.lower() for keyword in excluded_keywords
+            )
+            has_excluded_keyword = has_excluded_keyword or bool(
+                re.search(r'(?<![A-Za-z])TM(?![A-Za-z])', title, re.IGNORECASE)
+            )
+
+            if is_gwangju and is_entry_level and is_full_time and not has_excluded_keyword:
+                filtered_jobs.append(job)
+
+        print(
+            f"🎯 조건 필터 결과: {len(jobs)}개 중 {len(filtered_jobs)}개 "
+            "(광주 / 신입·경력무관 / 정규직)"
+        )
+        return filtered_jobs
 
     def _get_keyword_stats(self, jobs):
         """키워드별 통계 생성"""
@@ -392,40 +445,33 @@ class SaraminCrawler:
         """여러가지 필터들을 활용한 크롤링"""
         print("🚀 크롤링 시작!")
 
-        # 다양한 검색 조건들
-        search_configs = [
-            {
-                'name': '병원 데이터 고연봉 정규직',
-                'keyword': '병원 데이터',
-                'salary_min': '3000만원~',
-                'company_types': ['대기업', '중견기업'],
-                'job_types': ['정규직'],
-            },
-            {
-                'name': '스타트업 PM 재택근무',
-                'keyword': 'PM',
-                'company_types': ['스타트업'],
-                'job_types': ['정규직', '계약직'],
-                'remote_work': True,
-                'work_day': ['유연근무제']
-            },
-            {
-                'name': '헬스케어 기획직',
-                'keyword': '헬스케어',
-                'job_types': ['정규직'],
-                'exclude_keywords': ['학교'],
-            }
+        # 회사마다 공고 제목이 달라 놓치지 않도록 관련 검색어를 넓게 사용한다.
+        search_keywords = [
+            '콘텐츠 마케터',
+            'SNS 마케터',
+            '콘텐츠 기획',
+            '디지털 마케터',
+            '브랜드 콘텐츠',
+            '영상 콘텐츠',
+            '마케팅 기획',
+        ]
+        excluded_keywords = [
+            '영업', '보험', '텔레마케팅', 'TM', '방문판매',
+            '부동산', '고객상담', '아웃바운드'
         ]
 
         all_jobs = []
 
-        for config in search_configs:
-            print(f"\n📋 {config['name']} 검색 중...")
-            keyword = config.pop('name')
-
-            keyword = config.pop('keyword', '데이터')  # keyword 추출
-            
-            jobs = self.search_jobs(keyword=keyword, **config)
+        for keyword in search_keywords:
+            print(f"\n📋 {keyword} 검색 중...")
+            jobs = self.search_jobs(
+                keyword=keyword,
+                locations=['광주'],
+                entry_level_only=True,
+                job_types=['정규직'],
+                work_days=['주5일'],
+                exclude_keywords=excluded_keywords,
+            )
             all_jobs.extend(jobs)
             print(f"✅ {len(jobs)}개 공고 수집")
 
@@ -441,14 +487,19 @@ class SaraminCrawler:
 
         print(f"\n🎉 총 {len(unique_jobs)}개 고유 공고 수집!")
 
+        # 사람인 검색 결과에서 지역과 경력을 다시 검사한다.
+        target_jobs = self.filter_target_jobs(unique_jobs)
+
         # CSV 저장
         # filename = self.save_to_csv(unique_jobs)
         
         # 이메일 알림
-        if email_config and unique_jobs:
-            self.send_email_notification(unique_jobs, email_config)
+        if email_config and target_jobs:
+            self.send_email_notification(target_jobs, email_config)
+        elif email_config:
+            print("📭 오늘 조건에 맞는 새 공고가 없어 이메일을 보내지 않습니다.")
         
-        return unique_jobs
+        return target_jobs
 
 if __name__ == "__main__":
     crawler = SaraminCrawler()
@@ -477,6 +528,15 @@ if __name__ == "__main__":
         'receiver_email': os.environ.get('EMAIL_RECEIVER'),
         'app_password': os.environ.get('EMAIL_APP_PASSWORD')
     }
+
+    missing_secrets = [
+        key for key, value in email_config.items() if not value
+    ]
+    if missing_secrets:
+        raise RuntimeError(
+            "GitHub Secrets에 EMAIL_SENDER, EMAIL_RECEIVER, "
+            "EMAIL_APP_PASSWORD를 모두 등록해주세요."
+        )
 
     # 자동화 실행
     # all_jobs = crawler.run_advanced_crawler()
