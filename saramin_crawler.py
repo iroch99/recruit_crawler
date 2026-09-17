@@ -5,7 +5,7 @@ import time
 import os
 import re
 import ssl
-from datetime import datetime
+from datetime import datetime, timedelta
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -248,6 +248,24 @@ class SaraminCrawler:
                 work_type_elem = condition_elem[3]
                 work_type = work_type_elem.get_text(strip=True)
 
+            # 급여
+            salary = "급여 정보 없음"
+            if len(condition_elem) > 4:
+                salary = condition_elem[4].get_text(strip=True)
+
+            # 사람인 목록에 표시되는 등록일 또는 수정일
+            posted_date = ""
+            posted_date_elem = item.select_one('div.job_sector > span.job_day')
+            if posted_date_elem:
+                date_match = re.search(
+                    r'(\d{2})\/(\d{2})\/(\d{2})',
+                    posted_date_elem.get_text(strip=True)
+                )
+                if date_match:
+                    posted_date = datetime.strptime(
+                        date_match.group(0), '%y/%m/%d'
+                    ).strftime('%Y-%m-%d')
+
             # 공고 ID 추출
             rec_idx = item.get('value', '')
 
@@ -259,6 +277,8 @@ class SaraminCrawler:
                 'career': career,
                 'education': education,
                 'work_type': work_type,
+                'salary': salary,
+                'posted_date': posted_date,
                 'deadline': deadline,
                 'link': link,
                 'rec_idx': rec_idx,
@@ -342,6 +362,8 @@ class SaraminCrawler:
                     📍 {' '.join(job['location']) if isinstance(job['location'], list) else job['location']} | 
                     👔 {job['career']} | 
                     🎓 {job['education']} | 
+                    💰 {job['salary']} |
+                    🗓️ 등록/수정일 {job['posted_date']} |
                     ⏰ {job['deadline']}
                 </div>
                 <a href="{job['link']}" class="btn" target="_blank">지원하기 →</a>
@@ -399,11 +421,13 @@ class SaraminCrawler:
             raise
 
     def filter_target_jobs(self, jobs):
-        """광주 지역의 신입 지원 가능 정규직 공고만 남긴다."""
+        """사용자가 원하는 지역·경력·급여·등록일 조건만 남긴다."""
         excluded_keywords = [
             '영업', '보험', '텔레마케팅', '방문판매',
             '부동산', '고객상담', '아웃바운드'
         ]
+        today = datetime.now().date()
+        three_weeks_ago = today - timedelta(days=21)
 
         filtered_jobs = []
         for job in jobs:
@@ -411,10 +435,20 @@ class SaraminCrawler:
             location = str(job.get('location') or '')
             career = str(job.get('career') or '')
             work_type = str(job.get('work_type') or '')
+            salary = str(job.get('salary') or '')
+
+            try:
+                posted_date = datetime.strptime(
+                    job.get('posted_date', ''), '%Y-%m-%d'
+                ).date()
+                is_recent = three_weeks_ago <= posted_date <= today
+            except (TypeError, ValueError):
+                is_recent = False
 
             is_gwangju = '광주' in location
             is_entry_level = '신입' in career or '경력무관' in career
             is_full_time = '정규직' in work_type
+            salary_is_allowed = '면접후결정' not in re.sub(r'\s+', '', salary)
             has_excluded_keyword = any(
                 keyword.lower() in title.lower() for keyword in excluded_keywords
             )
@@ -422,12 +456,19 @@ class SaraminCrawler:
                 re.search(r'(?<![A-Za-z])TM(?![A-Za-z])', title, re.IGNORECASE)
             )
 
-            if is_gwangju and is_entry_level and is_full_time and not has_excluded_keyword:
+            if (
+                is_gwangju
+                and is_entry_level
+                and is_full_time
+                and is_recent
+                and salary_is_allowed
+                and not has_excluded_keyword
+            ):
                 filtered_jobs.append(job)
 
         print(
             f"🎯 조건 필터 결과: {len(jobs)}개 중 {len(filtered_jobs)}개 "
-            "(광주 / 신입·경력무관 / 정규직)"
+            "(광주 / 신입·경력무관 / 정규직 / 최근 3주 / 면접 후 결정 제외)"
         )
         return filtered_jobs
 
